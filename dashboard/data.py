@@ -1,17 +1,17 @@
-import os
 from functools import lru_cache
+from pathlib import Path
 
 import polars as pl
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
 
-load_dotenv()
+_DATA_DIR = Path(__file__).parent / "data"
 
-_engine = create_engine(
-    f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
-    f"@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}"
-    f"/{os.getenv('DB_NAME')}",
-    pool_pre_ping=True,
+_qtd = pl.read_parquet(_DATA_DIR / "sia_qtd.parquet").with_columns(
+    pl.col("ano").cast(pl.Int64),
+    pl.col("municipio_cod").cast(pl.Utf8),
+)
+_val = pl.read_parquet(_DATA_DIR / "sia_valor.parquet").with_columns(
+    pl.col("ano").cast(pl.Int64),
+    pl.col("municipio_cod").cast(pl.Utf8),
 )
 
 REGIOES: dict[str, list[str]] = {
@@ -32,158 +32,148 @@ UF_COD: dict[str, str] = {
 }
 
 
-def _run(sql: str, params: dict | None = None) -> pl.DataFrame:
-    with _engine.connect() as conn:
-        r = conn.execute(text(sql), params or {})
-        keys = list(r.keys())
-        rows = r.fetchall()
-    if not rows:
-        return pl.DataFrame()
-    return pl.from_dicts([dict(zip(keys, row)) for row in rows])
+_MES_NUM: dict[str, int] = {
+    "Jan": 1, "Fev": 2, "Mar": 3, "Abr": 4,
+    "Mai": 5, "Jun": 6, "Jul": 7, "Ago": 8,
+    "Set": 9, "Out": 10, "Nov": 11, "Dez": 12,
+}
 
 
-@lru_cache(maxsize=2)
-def _proc_cols(table: str) -> tuple[str, ...]:
-    """Retorna as colunas de procedimento (começam com dígito) de uma tabela wide."""
-    df = _run(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = :t AND table_schema = 'public' "
-        "AND column_name ~ '^[0-9]' ORDER BY column_name",
-        {"t": table},
-    )
-    return tuple(df["column_name"].to_list()) if not df.is_empty() else ()
+def _periodo_idx(periodo: str) -> int:
+    mes, ano = periodo.split("/")
+    return int(ano) * 100 + _MES_NUM.get(mes, 0)
 
 
-def _sum_expr(table: str) -> str:
-    """Expressão SQL que soma todas as colunas de procedimento de uma tabela wide."""
-    cols = _proc_cols(table)
+def _proc_cols(df: pl.DataFrame) -> list[str]:
+    return [c for c in df.columns if c[:1].isdigit()]
+
+
+def _row_sum_expr(df: pl.DataFrame) -> pl.Expr:
+    cols = _proc_cols(df)
     if not cols:
-        return "0"
-    return " + ".join(f'COALESCE("{c}", 0)' for c in cols)
+        return pl.lit(0.0).alias("_total")
+    return pl.sum_horizontal([pl.col(c).cast(pl.Float64) for c in cols]).alias("_total")
 
 
-def _where(
-    ano_ini: int,
-    ano_fim: int,
+def _filter(
+    df: pl.DataFrame,
+    periodo_ini: str,
+    periodo_fim: str,
     municipios: list[str] | None = None,
     uf_prefixes: list[str] | None = None,
-) -> tuple[str, dict]:
-    """
-    Prioridade: municipios > uf_prefixes (uma UF ou lista de UFs de uma região).
-    Parâmetros de ano são injetados via SQLAlchemy; códigos passam por isdigit().
-    """
-    clause = "ano BETWEEN :a1 AND :a2"
-    params: dict = {"a1": str(ano_ini), "a2": str(ano_fim)}
-
+) -> pl.DataFrame:
+    idx_ini = _periodo_idx(periodo_ini)
+    idx_fim = _periodo_idx(periodo_fim)
+    df = df.with_columns(
+        (pl.col("ano").cast(pl.Int64) * 100 +
+         pl.col("mes").map_elements(lambda m: _MES_NUM.get(m, 0), return_dtype=pl.Int64)
+         ).alias("_idx")
+    ).filter(
+        (pl.col("_idx") >= idx_ini) & (pl.col("_idx") <= idx_fim)
+    ).drop("_idx")
     if municipios:
-        safe = [c for c in municipios if str(c).isdigit()]
-        if safe:
-            in_list = ", ".join(f"'{c}'" for c in safe)
-            clause += f" AND municipio_cod IN ({in_list})"
+        df = df.filter(pl.col("municipio_cod").is_in([str(m) for m in municipios]))
     elif uf_prefixes:
-        safe = [p for p in uf_prefixes if str(p).isdigit()]
-        if safe:
-            likes = " OR ".join(f"municipio_cod LIKE '{p}%'" for p in safe)
-            clause += f" AND ({likes})"
+        mask = pl.lit(False)
+        for p in uf_prefixes:
+            mask = mask | pl.col("municipio_cod").str.starts_with(str(p))
+        df = df.filter(mask)
+    return df
 
-    return clause, params
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
-def get_anos() -> list[int]:
-    df = _run("SELECT DISTINCT ano FROM sia_qtd WHERE ano IS NOT NULL ORDER BY ano")
-    return [int(a) for a in df["ano"].to_list()] if not df.is_empty() else list(range(2008, 2025))
+def get_periodos() -> list[str]:
+    rows = _qtd.select(["mes", "ano"]).unique().iter_rows(named=True)
+    periodos = [f"{r['mes']}/{r['ano']}" for r in rows]
+    return sorted(periodos, key=_periodo_idx)
 
 
 @lru_cache(maxsize=30)
 def get_municipios(uf: str) -> tuple[dict, ...]:
     cod = UF_COD.get(uf, "")
-    df = _run(
-        "SELECT DISTINCT municipio_cod, municipio_nome "
-        "FROM sia_qtd WHERE municipio_cod LIKE :p ORDER BY municipio_nome",
-        {"p": f"{cod}%"},
+    df = (
+        _qtd.filter(pl.col("municipio_cod").str.starts_with(cod))
+        .select(["municipio_cod", "municipio_nome"])
+        .unique()
+        .sort("municipio_nome")
     )
-    return tuple(df.iter_rows(named=True)) if not df.is_empty() else ()
+    return tuple(df.iter_rows(named=True))
 
 
 def query_kpis(
-    ano_ini: int,
-    ano_fim: int,
+    periodo_ini: str,
+    periodo_fim: str,
     municipios: list[str] | None = None,
     uf_prefixes: list[str] | None = None,
 ) -> dict:
-    w, p = _where(ano_ini, ano_fim, municipios, uf_prefixes)
-    sq = _sum_expr("sia_qtd")
-    sv = _sum_expr("sia_valor")
-    df = _run(
-        f"SELECT"
-        f"  (SELECT COALESCE(SUM({sq}), 0) FROM sia_qtd WHERE {w}) AS qtd,"
-        f"  (SELECT COALESCE(SUM({sv}), 0) FROM sia_valor WHERE {w}) AS valor",
-        p,
-    )
-    if df.is_empty():
-        return {"qtd": 0, "valor": 0.0}
-    return {"qtd": float(df["qtd"][0] or 0), "valor": float(df["valor"][0] or 0)}
+    qtd_df = _filter(_qtd, periodo_ini, periodo_fim, municipios, uf_prefixes)
+    val_df = _filter(_val, periodo_ini, periodo_fim, municipios, uf_prefixes)
+
+    qtd = float(qtd_df.select(_row_sum_expr(qtd_df))["_total"].sum()) if not qtd_df.is_empty() else 0.0
+    val = float(val_df.select(_row_sum_expr(val_df))["_total"].sum()) if not val_df.is_empty() else 0.0
+
+    return {"qtd": qtd, "valor": val}
 
 
 def query_serie_temporal(
-    ano_ini: int,
-    ano_fim: int,
+    periodo_ini: str,
+    periodo_fim: str,
     municipios: list[str] | None = None,
     uf_prefixes: list[str] | None = None,
 ) -> pl.DataFrame:
-    w, p = _where(ano_ini, ano_fim, municipios, uf_prefixes)
-    sq = _sum_expr("sia_qtd")
-    sv = _sum_expr("sia_valor")
-    return _run(
-        f"""
-        SELECT q.ano, q.mes, q.quantidade, COALESCE(v.valor, 0) AS valor
-        FROM (
-            SELECT ano, mes, SUM({sq}) AS quantidade
-            FROM sia_qtd
-            WHERE {w}
-            GROUP BY ano, mes
-        ) q
-        LEFT JOIN (
-            SELECT ano, mes, SUM({sv}) AS valor
-            FROM sia_valor
-            WHERE {w}
-            GROUP BY ano, mes
-        ) v ON q.ano = v.ano AND q.mes = v.mes
-        ORDER BY q.ano, q.mes
-        """,
-        p,
+    qtd_df = _filter(_qtd, periodo_ini, periodo_fim, municipios, uf_prefixes)
+    val_df = _filter(_val, periodo_ini, periodo_fim, municipios, uf_prefixes)
+
+    if qtd_df.is_empty():
+        return pl.DataFrame()
+
+    ts_qtd = (
+        qtd_df
+        .with_columns(_row_sum_expr(qtd_df))
+        .group_by(["ano", "mes"])
+        .agg(pl.col("_total").sum().alias("quantidade"))
     )
+
+    if not val_df.is_empty():
+        ts_val = (
+            val_df
+            .with_columns(_row_sum_expr(val_df))
+            .group_by(["ano", "mes"])
+            .agg(pl.col("_total").sum().alias("valor"))
+        )
+        result = ts_qtd.join(ts_val, on=["ano", "mes"], how="left").with_columns(
+            pl.col("valor").fill_null(0.0)
+        )
+    else:
+        result = ts_qtd.with_columns(pl.lit(0.0).alias("valor"))
+
+    return result.sort(["ano", "mes"])
 
 
 def query_grupos(
-    ano_ini: int,
-    ano_fim: int,
+    periodo_ini: str,
+    periodo_fim: str,
     municipios: list[str] | None = None,
     uf_prefixes: list[str] | None = None,
 ) -> pl.DataFrame:
-    """Retorna (grupo, quantidade, valor) somados por grupo de procedimento."""
-    w, p = _where(ano_ini, ano_fim, municipios, uf_prefixes)
-    cols_qtd = _proc_cols("sia_qtd")
-    cols_val = _proc_cols("sia_valor")
+    qtd_df = _filter(_qtd, periodo_ini, periodo_fim, municipios, uf_prefixes)
+    val_df = _filter(_val, periodo_ini, periodo_fim, municipios, uf_prefixes)
+
+    cols_qtd = _proc_cols(qtd_df)
+    cols_val = _proc_cols(val_df)
+
     if not cols_qtd and not cols_val:
         return pl.DataFrame()
 
     qtd_map: dict[str, float] = {}
-    if cols_qtd:
-        sel = ", ".join(f'SUM(COALESCE("{c}", 0)) AS "g{i}"' for i, c in enumerate(cols_qtd))
-        df = _run(f"SELECT {sel} FROM sia_qtd WHERE {w}", p)
-        if not df.is_empty():
-            qtd_map = {c: float(df[f"g{i}"][0] or 0) for i, c in enumerate(cols_qtd)}
+    if cols_qtd and not qtd_df.is_empty():
+        sums = qtd_df.select([pl.col(c).cast(pl.Float64).sum() for c in cols_qtd])
+        qtd_map = {c: float(sums[c][0] or 0) for c in cols_qtd}
 
     val_map: dict[str, float] = {}
-    if cols_val:
-        sel = ", ".join(f'SUM(COALESCE("{c}", 0)) AS "g{i}"' for i, c in enumerate(cols_val))
-        df = _run(f"SELECT {sel} FROM sia_valor WHERE {w}", p)
-        if not df.is_empty():
-            val_map = {c: float(df[f"g{i}"][0] or 0) for i, c in enumerate(cols_val)}
+    if cols_val and not val_df.is_empty():
+        sums = val_df.select([pl.col(c).cast(pl.Float64).sum() for c in cols_val])
+        val_map = {c: float(sums[c][0] or 0) for c in cols_val}
 
     all_groups = sorted(set(cols_qtd) | set(cols_val))
     rows = [
@@ -194,33 +184,38 @@ def query_grupos(
 
 
 def query_ranking(
-    ano_ini: int,
-    ano_fim: int,
+    periodo_ini: str,
+    periodo_fim: str,
     municipios: list[str] | None = None,
     uf_prefixes: list[str] | None = None,
     top: int = 20,
 ) -> pl.DataFrame:
-    w, p = _where(ano_ini, ano_fim, municipios, uf_prefixes)
-    sq = _sum_expr("sia_qtd")
-    sv = _sum_expr("sia_valor")
-    return _run(
-        f"""
-        SELECT q.municipio_nome, q.quantidade, COALESCE(v.valor, 0) AS valor
-        FROM (
-            SELECT municipio_cod, municipio_nome, SUM({sq}) AS quantidade
-            FROM sia_qtd
-            WHERE {w}
-            GROUP BY municipio_cod, municipio_nome
-            ORDER BY quantidade DESC
-            LIMIT {top}
-        ) q
-        LEFT JOIN (
-            SELECT municipio_cod, SUM({sv}) AS valor
-            FROM sia_valor
-            WHERE {w}
-            GROUP BY municipio_cod
-        ) v ON q.municipio_cod = v.municipio_cod
-        ORDER BY q.quantidade DESC
-        """,
-        p,
+    qtd_df = _filter(_qtd, periodo_ini, periodo_fim, municipios, uf_prefixes)
+    val_df = _filter(_val, periodo_ini, periodo_fim, municipios, uf_prefixes)
+
+    if qtd_df.is_empty():
+        return pl.DataFrame()
+
+    rank_qtd = (
+        qtd_df
+        .with_columns(_row_sum_expr(qtd_df))
+        .group_by(["municipio_cod", "municipio_nome"])
+        .agg(pl.col("_total").sum().alias("quantidade"))
+        .sort("quantidade", descending=True)
+        .head(top)
     )
+
+    if not val_df.is_empty():
+        rank_val = (
+            val_df
+            .with_columns(_row_sum_expr(val_df))
+            .group_by("municipio_cod")
+            .agg(pl.col("_total").sum().alias("valor"))
+        )
+        result = rank_qtd.join(rank_val, on="municipio_cod", how="left").with_columns(
+            pl.col("valor").fill_null(0.0)
+        )
+    else:
+        result = rank_qtd.with_columns(pl.lit(0.0).alias("valor"))
+
+    return result.sort("quantidade", descending=True)

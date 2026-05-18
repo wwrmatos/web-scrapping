@@ -139,22 +139,36 @@ async def get_data():
 
                     pre_element = await pagina_resultado.query_selector('pre')
                     texto = await pre_element.inner_text()
-                    linhas = [linha.split(';')
-                              for linha in texto.strip().split('\n')]
+                    linhas_raw = texto.strip().split('\n')
 
-                    df_mes = pd.DataFrame(linhas)
+                    if len(linhas_raw) < 2:
+                        raise ValueError("Dados insuficientes no pre")
+
+                    # DATASUS inclui o período no final da linha de cabeçalho (ex: "Jan/2024")
+                    # Removemos para que o nome das colunas seja consistente entre meses
+                    cabecalho = [c.strip().strip('"') for c in linhas_raw[0].split(';')]
+                    if cabecalho and '/' in cabecalho[-1]:
+                        cabecalho = cabecalho[:-1]
+                    n_colunas = len(cabecalho)
+
+                    dados = []
+                    for linha in linhas_raw[1:]:
+                        if linha.strip():
+                            valores = [v.strip().strip('"') for v in linha.split(';')]
+                            valores = (valores + [''] * n_colunas)[:n_colunas]
+                            dados.append(valores)
+
+                    df_mes = pd.DataFrame(dados, columns=cabecalho)
+                    df_mes['periodo'] = ano_mes_text
+
                     print(
                         f"    ✓ Capturado {len(df_mes)} linhas para {ano_mes_text}")
-
-                    df_mes['periodo'] = ano_mes_text
 
                     if df_consolidado.empty:
                         df_consolidado = df_mes
                     else:
-                        df_mes_sem_cabecalho = df_mes.iloc[1:] if len(
-                            df_mes) > 1 else df_mes
                         df_consolidado = pd.concat(
-                            [df_consolidado, df_mes_sem_cabecalho], ignore_index=True)
+                            [df_consolidado, df_mes], ignore_index=True)
 
                 except Exception as e:
                     safe_period = ano_mes_text.replace('/', '_')

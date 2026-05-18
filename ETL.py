@@ -36,7 +36,7 @@ def tratar_e_preparar_wide(caminho_csv):
     print(f"\n--- Lendo Arquivo: {os.path.basename(caminho_csv)} ---")
     
     # Leitura inicial pulando a primeira linha (skiprows=1)
-    df = pd.read_csv(caminho_csv, sep=';', encoding='utf-8-sig', skiprows=1, low_memory=False)
+    df = pd.read_csv(caminho_csv, sep=';', encoding='utf-8-sig', low_memory=False)
     
     # 1. Limpeza de nomes de colunas
     df.columns = [str(c).replace('"', '').strip() for c in df.columns]

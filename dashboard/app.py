@@ -6,7 +6,7 @@ import dash_bootstrap_components as dbc
 
 from data import (
     REGIOES, UF_COD,
-    get_anos, get_municipios,
+    get_periodos, get_municipios,
     query_kpis, query_serie_temporal, query_ranking, query_grupos,
 )
 
@@ -17,9 +17,9 @@ app = Dash(
 )
 server = app.server  # expõe para gunicorn / HuggingFace
 
-anos = get_anos()
-ANO_MIN = anos[0] if anos else 2008
-ANO_MAX = anos[-1] if anos else 2024
+periodos = get_periodos()
+PERIODO_INI = periodos[0] if periodos else "Jan/2024"
+PERIODO_FIM = periodos[-1] if periodos else "Jan/2026"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -261,20 +261,25 @@ filtros = dbc.Card(
             ], sm=12, md=6, lg=4, className="mb-2"),
 
             dbc.Col([
-                html.Label("Período (ano)", className="small fw-semibold text-muted"),
-                dcc.RangeSlider(
-                    id="sl-anos",
-                    min=ANO_MIN, max=ANO_MAX,
-                    value=[ANO_MIN, ANO_MAX],
-                    marks={
-                        y: {"label": str(y), "style": {"fontSize": "11px"}}
-                        for y in range(ANO_MIN, ANO_MAX + 1, 2)
-                    },
-                    step=1,
-                    tooltip={"placement": "bottom", "always_visible": True},
-                    className="mt-3",
+                html.Label("Período inicial", className="small fw-semibold text-muted"),
+                dcc.Dropdown(
+                    id="dd-periodo-ini",
+                    options=[{"label": p, "value": p} for p in periodos],
+                    value=PERIODO_INI,
+                    clearable=False,
+                    className="mt-1",
                 ),
-            ], sm=12, lg=4, className="mb-2"),
+            ], sm=6, lg=2, className="mb-2"),
+            dbc.Col([
+                html.Label("Período final", className="small fw-semibold text-muted"),
+                dcc.Dropdown(
+                    id="dd-periodo-fim",
+                    options=[{"label": p, "value": p} for p in periodos],
+                    value=PERIODO_FIM,
+                    clearable=False,
+                    className="mt-1",
+                ),
+            ], sm=6, lg=2, className="mb-2"),
         ], align="end"),
     ),
     style=_CARD, className="mb-3",
@@ -401,14 +406,14 @@ def cb_mun(uf: str | None):
     Output("chart-donut-qtd", "figure"),
     Output("chart-donut-valor", "figure"),
     Output("chart-rank","figure"),
-    Input("sl-anos",   "value"),
+    Input("dd-periodo-ini", "value"),
+    Input("dd-periodo-fim", "value"),
     Input("dd-regiao", "value"),
     Input("dd-uf",     "value"),
     Input("dd-mun",    "value"),
 )
-def cb_dashboard(anos_range: list, regiao: str | None, uf: str | None, municipios: list | None):
-    a1, a2 = anos_range
-    muns   = municipios if municipios else None
+def cb_dashboard(periodo_ini: str, periodo_fim: str, regiao: str | None, uf: str | None, municipios: list | None):
+    muns = municipios if municipios else None
 
     if muns:
         uf_prefixes = None
@@ -419,10 +424,10 @@ def cb_dashboard(anos_range: list, regiao: str | None, uf: str | None, municipio
     else:
         uf_prefixes = None
 
-    k     = query_kpis(a1, a2, muns, uf_prefixes)
-    df_ts = query_serie_temporal(a1, a2, muns, uf_prefixes)
-    df_rk = query_ranking(a1, a2, muns, uf_prefixes)
-    df_gp = query_grupos(a1, a2, muns, uf_prefixes)
+    k     = query_kpis(periodo_ini, periodo_fim, muns, uf_prefixes)
+    df_ts = query_serie_temporal(periodo_ini, periodo_fim, muns, uf_prefixes)
+    df_rk = query_ranking(periodo_ini, periodo_fim, muns, uf_prefixes)
+    df_gp = query_grupos(periodo_ini, periodo_fim, muns, uf_prefixes)
 
     return (
         _fmt_num(k["qtd"]),

@@ -81,7 +81,7 @@ def tratar_e_preparar_wide(caminho_csv):
     return df
 
 if __name__ == "__main__":
-    pasta = os.path.join(os.path.dirname(__file__), 'baixados_sia')
+    pasta = os.path.join(os.path.dirname(__file__), 'data', 'raw')
 
     for arquivo in os.listdir(pasta):
         caminho = os.path.join(pasta, arquivo)
@@ -89,7 +89,7 @@ if __name__ == "__main__":
             df_final = tratar_e_preparar_wide(caminho)
             if df_final is not None:
                 # Define o nome da tabela com base no arquivo
-                prefixo = "sia_qtd" if "Qtd" in caminho else "sia_valor"
+                prefixo = "sia_qtd" if "qtd" in arquivo.lower() else "sia_valor"
 
                 print(f"  🚀 Iniciando carga na tabela '{prefixo}' (Formato Wide)...")
 

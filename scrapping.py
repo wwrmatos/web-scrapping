@@ -62,7 +62,7 @@ async def select_option_by_label(page, selector, label, timeout=TIMEOUT):
 
 
 async def get_data():
-    os.makedirs("baixados_sia", exist_ok=True)
+    os.makedirs("data/raw", exist_ok=True)
 
     async with async_playwright() as p:
         # Lança navegador (headless=False para ver a automação)
@@ -194,8 +194,8 @@ async def get_data():
                         pass
                 await asyncio.sleep(1)
 
-            nome_clean = conteudo_nome.replace('/', '_').replace(' ', '_')
-            nome_arquivo = f"baixados_sia/SIA_{nome_clean}.csv"
+            nome_clean = conteudo_nome.replace('/', '_').replace(' ', '_').replace('.', '_').lower()
+            nome_arquivo = f"data/raw/sia_{nome_clean}.csv"
 
             if df_consolidado.empty:
                 print(

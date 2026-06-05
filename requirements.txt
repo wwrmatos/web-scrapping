@@ -1,0 +1,6 @@
+playwright
+pandas
+sqlalchemy
+psycopg2-binary
+python-dotenv
+polars
